@@ -153,6 +153,14 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const app = express();
 
 // ============================================
+// MESSAGE HANDLERS (external module)
+// ============================================
+const { registerStartHandler, checkSubscriptionHandler } = require('./messageHandlers');
+
+registerStartHandler(bot, STATE, WEB_APP_URL);
+app.get('/check-subscription', checkSubscriptionHandler(bot));
+
+// ============================================
 // EXPRESS MIDDLEWARE
 // ============================================
 
@@ -1002,39 +1010,6 @@ function stopMonitoring() {
 // ============================================
 // BOT COMMANDS
 // ============================================
-
-bot.onText(/\/start$/, async (msg) => {
-  const chatId = msg.chat.id;
-  const user = msg.from;
-  
-  STATE.userSessions.set(chatId, {
-    userId: user.id,
-    firstName: user.first_name,
-    lastName: user.last_name,
-    username: user.username,
-    lastActive: Date.now()
-  });
-  
-  await bot.sendMessage(chatId, 
-    `👋 <b>Welcome to Void Gift!</b>\n\n` +
-    `🎮 Play the spin wheel\n` +
-    `🎁 Win amazing prizes\n` +
-    `💰 Purchase coins with Telegram Stars\n` +
-    `📦 Build your collection\n\n` +
-    `Click the button below to start playing:`,
-    {
-      parse_mode: 'HTML',
-      reply_markup: {
-        inline_keyboard: [[
-          {
-            text: '🎮 Open Mini App',
-            web_app: { url: WEB_APP_URL }
-          }
-        ]]
-      }
-    }
-  );
-});
 
 bot.onText(/\/stats/, async (msg) => {
   const chatId = msg.chat.id;
