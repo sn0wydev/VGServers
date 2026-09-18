@@ -7,12 +7,7 @@
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const cors = require('cors');
-const os = require('os');
-const { exec } = require('child_process');
-const util = require('util');
-const execPromise = util.promisify(exec);
 const fs = require('fs').promises;
-const path = require('path');
 
 // ============================================
 // CONFIGURATION
@@ -24,17 +19,8 @@ const HTTP_PORT = process.env.PORT || 3000;
 
 // Telegram Group Logging Configuration
 const LOG_CHAT_ID = process.env.LOG_CHAT_ID;
-const SYSTEM_LOG_TOPIC_ID = 6;      // System monitoring, ping, power status
+const SYSTEM_LOG_TOPIC_ID = 6;      // Error/exception logs
 const TRANSACTION_LOG_TOPIC_ID = 3;  // Payments, refunds, transactions
-
-// CRITICAL: Your Telegram User ID for admin commands
-const ADMIN_IDS = [123456789]; // REPLACE WITH YOUR TELEGRAM USER ID
-
-// Monitoring Configuration
-const PING_CHECK_INTERVAL = 30000;
-const PING_SPIKE_THRESHOLD = 100;
-const PING_HISTORY_SIZE = 10;
-const STATUS_UPDATE_INTERVAL = 3600000;
 
 // ============================================
 // PRODUCT CATALOG - MATCHES WEBAPP (13 products)
@@ -140,12 +126,7 @@ const PRODUCTS = {
 
 const STATE = {
   userSessions: new Map(),
-  pingHistory: [],
-  lastPowerStatus: null,
   serverStartTime: Date.now(),
-  isMonitoring: false,
-  monitoringInterval: null,
-  statusUpdateInterval: null,
   pendingPayments: new Map() // Track payment_id -> {userId, productId, timestamp}
 };
 
@@ -171,113 +152,6 @@ app.use(cors({
 }));
 
 app.use(express.json());
-
-// ============================================
-// SYSTEM MONITORING FUNCTIONS
-// ============================================
-
-function getPowerSource() {
-  const platform = os.platform();
-  
-  if (platform === 'win32') {
-    return 'AC Power (Windows Desktop/Laptop)';
-  } else if (platform === 'darwin') {
-    return 'AC Power (macOS)';
-  } else if (platform === 'linux') {
-    try {
-      const hostname = os.hostname().toLowerCase();
-      
-      if (hostname.includes('heroku')) return 'Heroku Cloud';
-      if (hostname.includes('aws') || hostname.includes('ec2')) return 'AWS Cloud';
-      if (hostname.includes('azure')) return 'Azure Cloud';
-      if (hostname.includes('google') || hostname.includes('gcp')) return 'Google Cloud';
-      if (hostname.includes('digital')) return 'DigitalOcean';
-      if (hostname.includes('linode')) return 'Linode';
-      
-      return 'Linux Server/VPS';
-    } catch (error) {
-      return 'Linux Server';
-    }
-  } else {
-    return `${platform} System`;
-  }
-}
-
-function getSystemInfo() {
-  const uptime = os.uptime();
-  const totalMem = os.totalmem();
-  const freeMem = os.freemem();
-  const usedMem = totalMem - freeMem;
-  const memUsagePercent = ((usedMem / totalMem) * 100).toFixed(2);
-  
-  const cpus = os.cpus();
-  const cpuModel = cpus[0].model;
-  const cpuCount = cpus.length;
-  
-  const days = Math.floor(uptime / 86400);
-  const hours = Math.floor((uptime % 86400) / 3600);
-  const minutes = Math.floor((uptime % 3600) / 60);
-  const seconds = Math.floor(uptime % 60);
-  const uptimeStr = `${days}d ${hours}h ${minutes}m ${seconds}s`;
-  
-  return {
-    platform: os.platform(),
-    hostname: os.hostname(),
-    uptime: uptimeStr,
-    uptimeSeconds: uptime,
-    totalMemory: (totalMem / 1024 / 1024 / 1024).toFixed(2) + ' GB',
-    freeMemory: (freeMem / 1024 / 1024 / 1024).toFixed(2) + ' GB',
-    usedMemory: (usedMem / 1024 / 1024 / 1024).toFixed(2) + ' GB',
-    memoryUsage: memUsagePercent + '%',
-    cpuModel: cpuModel,
-    cpuCores: cpuCount,
-    architecture: os.arch(),
-    nodeVersion: process.version,
-    powerSource: getPowerSource()
-  };
-}
-
-async function pingHost(host = 'google.com') {
-  const platform = os.platform();
-  const pingCommand = platform === 'win32' 
-    ? `ping -n 1 ${host}` 
-    : `ping -c 1 ${host}`;
-  
-  try {
-    const startTime = Date.now();
-    await execPromise(pingCommand);
-    const pingTime = Date.now() - startTime;
-    return { success: true, time: pingTime, host };
-  } catch (error) {
-    return { success: false, time: null, host, error: error.message };
-  }
-}
-
-async function checkNetworkPing() {
-  const hosts = ['google.com', 'cloudflare.com', '1.1.1.1'];
-  const results = await Promise.all(hosts.map(host => pingHost(host)));
-  
-  const successfulPings = results.filter(r => r.success);
-  const avgPing = successfulPings.length > 0
-    ? Math.round(successfulPings.reduce((sum, r) => sum + r.time, 0) / successfulPings.length)
-    : null;
-  
-  return {
-    average: avgPing,
-    results: results,
-    timestamp: Date.now()
-  };
-}
-
-function detectPingSpike(currentPing) {
-  if (STATE.pingHistory.length < 3) return false;
-  
-  const recentPings = STATE.pingHistory.slice(-5);
-  const avgRecentPing = recentPings.reduce((sum, p) => sum + p, 0) / recentPings.length;
-  
-  const spike = currentPing - avgRecentPing;
-  return spike > PING_SPIKE_THRESHOLD;
-}
 
 // ============================================
 // LOGGING FUNCTIONS
@@ -307,127 +181,6 @@ async function sendTransactionLog(message, options = {}) {
   } catch (error) {
     console.error('Error sending transaction log to Telegram:', error);
   }
-}
-
-async function sendLog(message, options = {}) {
-  return sendSystemLog(message, options);
-}
-
-function formatSystemInfo(info) {
-  return `
-🖥 <b>SYSTEM INFORMATION</b>
-
-<b>Power Source:</b> ${info.powerSource}
-<b>Platform:</b> ${info.platform} (${info.architecture})
-<b>Hostname:</b> ${info.hostname}
-<b>Node Version:</b> ${info.nodeVersion}
-
-💻 <b>CPU:</b>
-- Model: ${info.cpuModel}
-- Cores: ${info.cpuCores}
-
-💾 <b>Memory:</b>
-- Total: ${info.totalMemory}
-- Used: ${info.usedMemory} (${info.memoryUsage})
-- Free: ${info.freeMemory}
-
-⏱ <b>Uptime:</b> ${info.uptime}
-  `.trim();
-}
-
-function formatPingInfo(pingData) {
-  const { average, results } = pingData;
-  
-  let message = `\n🌐 <b>NETWORK PING:</b>\n`;
-  
-  results.forEach(r => {
-    if (r.success) {
-      message += `• ${r.host}: ${r.time}ms ✅\n`;
-    } else {
-      message += `• ${r.host}: FAILED ❌\n`;
-    }
-  });
-  
-  if (average !== null) {
-    message += `\n<b>Average:</b> ${average}ms`;
-  } else {
-    message += `\n<b>Status:</b> All pings failed`;
-  }
-  
-  return message;
-}
-
-async function sendPowerOnNotification() {
-  const info = getSystemInfo();
-  const pingData = await checkNetworkPing();
-  
-  const message = `
-⚡️ <b>POWER IS ON!</b>
-━━━━━━━━━━━━━━━━━━━━
-
-${formatSystemInfo(info)}
-
-${formatPingInfo(pingData)}
-
-🕐 <b>Timestamp:</b> ${new Date().toLocaleString()}
-🔋 <b>Status:</b> Bot is now online and monitoring
-  `.trim();
-  
-  await sendSystemLog(message);
-}
-
-async function sendPingSpikeAlert(currentPing, avgPing, spike) {
-  const message = `
-⚠️ <b>PING SPIKE DETECTED!</b>
-━━━━━━━━━━━━━━━━━━━━
-
-📊 <b>Current Ping:</b> ${currentPing}ms
-📈 <b>Average Ping:</b> ${Math.round(avgPing)}ms
-🔺 <b>Spike:</b> +${Math.round(spike)}ms
-
-🕐 <b>Time:</b> ${new Date().toLocaleString()}
-  `.trim();
-  
-  await sendSystemLog(message);
-}
-
-async function sendPowerStatusChange(newStatus) {
-  const message = `
-🔄 <b>POWER STATUS CHANGE</b>
-━━━━━━━━━━━━━━━━━━━━
-
-<b>New Status:</b> ${newStatus}
-<b>Previous:</b> ${STATE.lastPowerStatus || 'Unknown'}
-
-🕐 <b>Time:</b> ${new Date().toLocaleString()}
-  `.trim();
-  
-  await sendSystemLog(message);
-}
-
-async function sendStatusUpdate() {
-  const info = getSystemInfo();
-  const pingData = await checkNetworkPing();
-  
-  const botUptime = Date.now() - STATE.serverStartTime;
-  const botDays = Math.floor(botUptime / 86400000);
-  const botHours = Math.floor((botUptime % 86400000) / 3600000);
-  const botMinutes = Math.floor((botUptime % 3600000) / 60000);
-  
-  const message = `
-📊 <b>STATUS UPDATE</b>
-━━━━━━━━━━━━━━━━━━━━
-
-${formatSystemInfo(info)}
-
-${formatPingInfo(pingData)}
-
-🤖 <b>Bot Uptime:</b> ${botDays}d ${botHours}h ${botMinutes}m
-
-🕐 <b>Timestamp:</b> ${new Date().toLocaleString()}
-  `.trim();
-  
-  await sendSystemLog(message);
 }
 
 async function sendErrorLog(error, context = '') {
@@ -619,7 +372,7 @@ app.get('/', (req, res) => {
     service: 'Void Gift Bot - Invoice API',
     version: '7.0',
     uptime: Math.floor((Date.now() - STATE.serverStartTime) / 1000),
-    features: ['openInvoice', 'cloudStorage', 'monitoring']
+    features: ['openInvoice', 'cloudStorage']
   });
 });
 
@@ -710,69 +463,6 @@ app.post('/create-invoice', async (req, res) => {
       error: 'Failed to create invoice',
       message: error.message
     });
-  }
-});
-
-// ============================================
-// REFUND SYSTEM
-// ============================================
-
-bot.onText(/\/refund (.+)/, async (msg, match) => {
-  const adminId = msg.from.id;
-  
-  if (!ADMIN_IDS.includes(adminId)) {
-    return bot.sendMessage(msg.chat.id, '❌ Unauthorized. Admin only.');
-  }
-  
-  const chargeId = match[1].trim();
-  
-  try {
-    const data = await fs.readFile('payments.json', 'utf8');
-    const payments = JSON.parse(data);
-    
-    const payment = payments.find(p => p.chargeId === chargeId);
-    
-    if (!payment) {
-      return bot.sendMessage(msg.chat.id, `❌ Payment not found: ${chargeId}`);
-    }
-    
-    if (payment.refunded) {
-      return bot.sendMessage(msg.chat.id, `⚠️ Already refunded: ${chargeId}`);
-    }
-    
-    const refunded = await bot.refundStarPayment(payment.userId, chargeId);
-    
-    if (refunded) {
-      payment.refunded = true;
-      payment.refundedAt = new Date().toISOString();
-      await fs.writeFile('payments.json', JSON.stringify(payments, null, 2));
-      
-      await sendTransactionLog(`
-💸 <b>REFUND PROCESSED</b>
-
-👤 <b>User ID:</b> <code>${payment.userId}</code>
-💳 <b>Charge ID:</b> <code>${chargeId}</code>
-⭐ <b>Stars Refunded:</b> ${payment.spentStars}
-🪙 <b>Coins Delivered (lost):</b> ${payment.coinsDelivered}
-📅 <b>Refund Date:</b> ${new Date().toISOString()}
-👨‍💼 <b>Processed by:</b> ${msg.from.username || msg.from.id}
-`);
-      
-      await bot.sendMessage(msg.chat.id, `✅ Refund successful!\n\nUser: ${payment.userId}\nStars: ${payment.spentStars}`);
-      
-      await bot.sendMessage(payment.userId, 
-        `💸 Your payment has been refunded!\n\n` +
-        `Stars refunded: ${payment.spentStars}\n` +
-        `Reason: Manual refund by admin`
-      );
-      
-    } else {
-      await bot.sendMessage(msg.chat.id, `❌ Refund failed. Check logs.`);
-    }
-    
-  } catch (error) {
-    console.error('❌ Refund error:', error);
-    await bot.sendMessage(msg.chat.id, `❌ Error: ${error.message}`);
   }
 });
 
@@ -939,154 +629,8 @@ async function handleSuccessfulPayment(msg) {
 }
 
 // ============================================
-// MONITORING LOOP
-// ============================================
-
-async function monitoringLoop() {
-  if (!STATE.isMonitoring) return;
-  
-  try {
-    const pingData = await checkNetworkPing();
-    
-    if (pingData.average !== null) {
-      STATE.pingHistory.push(pingData.average);
-      if (STATE.pingHistory.length > PING_HISTORY_SIZE) {
-        STATE.pingHistory.shift();
-      }
-      
-      if (STATE.pingHistory.length >= 3) {
-        const recentPings = STATE.pingHistory.slice(0, -1);
-        const avgRecent = recentPings.reduce((a, b) => a + b, 0) / recentPings.length;
-        const spike = pingData.average - avgRecent;
-        
-        if (spike > PING_SPIKE_THRESHOLD) {
-          await sendPingSpikeAlert(pingData.average, avgRecent, spike);
-        }
-      }
-    }
-    
-    const currentPowerSource = getPowerSource();
-    if (STATE.lastPowerStatus && STATE.lastPowerStatus !== currentPowerSource) {
-      await sendPowerStatusChange(currentPowerSource);
-    }
-    STATE.lastPowerStatus = currentPowerSource;
-    
-  } catch (error) {
-    console.error('Monitoring error:', error);
-    await sendErrorLog(error, 'Monitoring Loop');
-  }
-}
-
-async function startMonitoring() {
-  if (STATE.isMonitoring) return;
-  
-  STATE.isMonitoring = true;
-  STATE.lastPowerStatus = getPowerSource();
-  
-  await sendPowerOnNotification();
-  
-  STATE.monitoringInterval = setInterval(monitoringLoop, PING_CHECK_INTERVAL);
-  STATE.statusUpdateInterval = setInterval(sendStatusUpdate, STATUS_UPDATE_INTERVAL);
-  
-  console.log('✅ Monitoring started - sending logs to Telegram group');
-}
-
-function stopMonitoring() {
-  STATE.isMonitoring = false;
-  
-  if (STATE.monitoringInterval) {
-    clearInterval(STATE.monitoringInterval);
-    STATE.monitoringInterval = null;
-  }
-  
-  if (STATE.statusUpdateInterval) {
-    clearInterval(STATE.statusUpdateInterval);
-    STATE.statusUpdateInterval = null;
-  }
-  
-  console.log('⏸ Monitoring stopped');
-}
-
-// ============================================
 // BOT COMMANDS
 // ============================================
-
-bot.onText(/\/stats/, async (msg) => {
-  const chatId = msg.chat.id;
-  
-  try {
-    const info = getSystemInfo();
-    const pingData = await checkNetworkPing();
-    
-    const message = formatSystemInfo(info) + '\n\n' + formatPingInfo(pingData);
-    
-    await bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
-  } catch (error) {
-    await bot.sendMessage(chatId, '❌ Error getting stats: ' + error.message);
-  }
-});
-
-bot.onText(/\/ping/, async (msg) => {
-  const chatId = msg.chat.id;
-  
-  await bot.sendMessage(chatId, '🔍 Checking network...');
-  
-  try {
-    const pingData = await checkNetworkPing();
-    const message = '🌐 <b>Network Status</b>\n\n' + formatPingInfo(pingData);
-    
-    await bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
-  } catch (error) {
-    await bot.sendMessage(chatId, '❌ Error checking ping: ' + error.message);
-  }
-});
-
-bot.onText(/\/monitor (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const action = match[1];
-  
-  if (action === 'start') {
-    if (STATE.isMonitoring) {
-      await bot.sendMessage(chatId, '⚠️ Monitoring is already running');
-    } else {
-      await startMonitoring();
-      await bot.sendMessage(chatId, '✅ Monitoring started - logs will be sent to the group');
-    }
-  } else if (action === 'stop') {
-    if (!STATE.isMonitoring) {
-      await bot.sendMessage(chatId, '⚠️ Monitoring is not running');
-    } else {
-      stopMonitoring();
-      await bot.sendMessage(chatId, '⏸ Monitoring stopped');
-    }
-  } else if (action === 'status') {
-    const status = STATE.isMonitoring ? '✅ Running' : '⏸ Stopped';
-    const uptime = Date.now() - STATE.serverStartTime;
-    const minutes = Math.floor(uptime / 60000);
-    const lastPing = STATE.pingHistory[STATE.pingHistory.length - 1] || 'N/A';
-    
-    await bot.sendMessage(chatId,
-      `📊 <b>Monitoring Status:</b> ${status}\n` +
-      `⏱ <b>Bot Uptime:</b> ${minutes} minutes\n` +
-      `📈 <b>Ping History:</b> ${STATE.pingHistory.length} readings\n` +
-      `🌐 <b>Last Ping:</b> ${lastPing}ms`,
-      { parse_mode: 'HTML' }
-    );
-  }
-});
-
-bot.onText(/\/update/, async (msg) => {
-  const chatId = msg.chat.id;
-  
-  await bot.sendMessage(chatId, '📊 Sending status update to logs...');
-  
-  try {
-    await sendStatusUpdate();
-    await bot.sendMessage(chatId, '✅ Status update sent to group');
-  } catch (error) {
-    await bot.sendMessage(chatId, '❌ Error: ' + error.message);
-  }
-});
 
 bot.onText(/\/help/, async (msg) => {
   const chatId = msg.chat.id;
@@ -1096,19 +640,8 @@ bot.onText(/\/help/, async (msg) => {
 
 <b>Game Commands:</b>
 /start - Open the mini app
-/stats - View system & network statistics
 
-<b>Monitoring Commands:</b>
-/ping - Check network ping
-/monitor start - Start monitoring
-/monitor stop - Stop monitoring
-/monitor status - Check monitoring status
-/update - Send status update to logs
-
-<b>Admin Commands:</b>
-/refund [charge_id] - Refund a payment
-
-<b>Payment System (NEW!):</b>
+<b>Payment System:</b>
 ✅ Direct invoice opening with openInvoice()
 ✅ Invoice appears as popup in Mini App
 ✅ NO chat redirect needed
@@ -1116,7 +649,6 @@ bot.onText(/\/help/, async (msg) => {
 ✅ Automatic coin delivery via Cloud Storage
 ✅ 13 coin packages available
 ✅ Transaction logging
-✅ Refund support
 
 <b>How Payments Work:</b>
 1. User clicks "Purchase" in Mini App
@@ -1133,13 +665,8 @@ bot.onText(/\/help/, async (msg) => {
 - 📊 Logging: Enabled
 
 <b>Features:</b>
-- 🔋 Power status monitoring
-- 🌐 Network ping tracking
-- ⚠️ Automatic spike detection
-- 📊 Regular status updates
 - 📝 Detailed transaction logs
 - 💰 Secure Star payments
-- 💸 Admin refund system
   `.trim();
   
   await bot.sendMessage(chatId, helpText, { parse_mode: 'HTML' });
@@ -1196,7 +723,6 @@ async function startBot() {
   console.log('💰 Payment System: Telegram Stars (openInvoice)');
   console.log('📦 Available Packages: 13');
   console.log('📝 Transaction Logging: Enabled');
-  console.log('💸 Refund System: Active');
   console.log('');
   console.log('🆕 NEW PAYMENT FLOW:');
   console.log('   1. User clicks Purchase in Mini App');
@@ -1216,12 +742,6 @@ async function startBot() {
     console.log('');
   });
   
-  // Start monitoring
-  await startMonitoring();
-  
-  console.log('✅ System monitoring enabled');
-  console.log('📊 Logs will be sent to Telegram group');
-  console.log('');
   console.log('═══════════════════════════════════════════');
   console.log('🎮 BOT IS READY - Waiting for requests...');
   console.log('═══════════════════════════════════════════');
