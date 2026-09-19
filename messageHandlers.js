@@ -10,6 +10,54 @@
 // stays exactly where it already is in bot.js.
 
 // ------------------------------------------------
+// 0. Persisted user storage (users.json)
+// STATE.userSessions is just an in-memory Map, wiped on every restart/
+// redeploy. That made /pushAnnounce only reach whoever ran /start *after*
+// the last deploy. users.json is the durable copy — same read-modify-write
+// pattern bot.js already uses for payments.json — and STATE.userSessions
+// gets hydrated from it once at boot (see loadUsersIntoState below, called
+// from bot.js before registerStartHandler is wired up).
+// ------------------------------------------------
+const fs = require('fs');
+const path = require('path');
+const USERS_DB_PATH = path.join(__dirname, 'users.json');
+
+function loadUsersFromDisk() {
+  try {
+    return JSON.parse(fs.readFileSync(USERS_DB_PATH, 'utf8'));
+  } catch (e) {
+    return {}; // file doesn't exist yet, or is corrupt — start fresh
+  }
+}
+
+function saveUsersToDisk(usersObj) {
+  try {
+    fs.writeFileSync(USERS_DB_PATH, JSON.stringify(usersObj, null, 2));
+  } catch (e) {
+    console.error('❌ Failed to write users.json:', e.message);
+  }
+}
+
+function persistUser(chatId, session) {
+  const usersObj = loadUsersFromDisk();
+  usersObj[chatId] = session;
+  saveUsersToDisk(usersObj);
+}
+
+// Call once at boot, before registerStartHandler starts adding new
+// entries, so the broadcast list already has every user who has ever
+// run /start, not just ones seen since the last restart.
+function loadUsersIntoState(STATE) {
+  const usersObj = loadUsersFromDisk();
+  let count = 0;
+  for (const [chatId, session] of Object.entries(usersObj)) {
+    STATE.userSessions.set(Number(chatId), session);
+    count++;
+  }
+  console.log(`👥 Loaded ${count} persisted user(s) from users.json`);
+}
+
+// ------------------------------------------------
 // 1. /start
 // ------------------------------------------------
 function registerStartHandler(bot, STATE, WEB_APP_URL) {
@@ -17,13 +65,15 @@ function registerStartHandler(bot, STATE, WEB_APP_URL) {
     const chatId = msg.chat.id;
     const user = msg.from;
 
-    STATE.userSessions.set(chatId, {
+    const session = {
       userId: user.id,
       firstName: user.first_name,
       lastName: user.last_name,
       username: user.username,
       lastActive: Date.now()
-    });
+    };
+    STATE.userSessions.set(chatId, session);
+    persistUser(chatId, session);
 
     await bot.sendMessage(chatId,
       `👋 <b>Welcome to Void Gift!</b>\n\n` +
@@ -171,6 +221,9 @@ function pushAnnounceHandler(bot, STATE) {
           if (err.response && err.response.statusCode === 403) {
             blocked++;
             STATE.userSessions.delete(chatId);
+            const usersObj = loadUsersFromDisk();
+            delete usersObj[chatId];
+            saveUsersToDisk(usersObj);
           } else {
             failed++;
             console.error(`push-announce failed for ${chatId}:`, err.message);
@@ -188,4 +241,4 @@ function pushAnnounceHandler(bot, STATE) {
   };
 }
 
-module.exports = { registerStartHandler, checkSubscriptionHandler, pushAnnounceHandler };
+module.exports = { registerStartHandler, checkSubscriptionHandler, pushAnnounceHandler, loadUsersIntoState };
