@@ -73,29 +73,34 @@ function checkSubscriptionHandler(bot) {
   };
 }
 
+// PUSH_BRIDGE_SECRET: shared secret the support bot must send in the
+// x-push-secret header on every /push-announce request. Must match the
+// value set on the support bot's process exactly. Lives here (not in
+// bot.js) since this file already owns all the "global announcement /
+// subscription check" surface area — bot.js just wires the route.
+const PUSH_BRIDGE_SECRET = process.env.PUSH_BRIDGE_SECRET;
+if (!PUSH_BRIDGE_SECRET) {
+  console.warn('⚠️  PUSH_BRIDGE_SECRET not set — /push-announce will reject every request.');
+}
+
 // ------------------------------------------------
 // 3. POST /push-announce
 // Called by the support bot's /pushAnnounce command — NOT by users, and
 // NOT reachable without the shared secret. Body:
 //   { managerId, text, photoBase64, photoMime }
-// Header: x-push-secret must equal the PUSH_BRIDGE_SECRET this handler
-// was constructed with (same value the support bot process holds).
+// Header: x-push-secret must equal PUSH_BRIDGE_SECRET above.
 //
 // Broadcasts to every chatId currently in STATE.userSessions — i.e.
 // everyone who has ever run /start. This is a blast-radius action, so the
 // secret check is fail-closed: if no secret was configured, every request
 // is rejected rather than silently allowed.
 //
-// ASSUMPTION: I don't have your main bot's entry file (only this
-// messageHandlers.js), so I don't know how your Express app/bot instance
-// are wired together. This is written the same way checkSubscriptionHandler
-// already is — a factory that returns an Express handler — so wire it in
-// next to that one, e.g.:
-//   app.post('/push-announce', express.json({ limit: '10mb' }),
-//     pushAnnounceHandler(bot, STATE, { secret: process.env.PUSH_BRIDGE_SECRET }));
-// Note express.json() with a raised body limit: a photo comes across as
-// base64 in the JSON body, and the default ~100kb Express limit will
-// reject anything but a tiny image.
+// Wire this into your Express app next to checkSubscriptionHandler:
+//   app.post('/push-announce', pushAnnounceHandler(bot, STATE));
+// Needs express.json() registered before it, with a raised limit (a photo
+// comes across as base64 in the body, and Express's default ~100kb limit
+// will reject anything but a tiny image) — e.g.
+//   app.use(express.json({ limit: '10mb' }));
 //
 // ASSUMPTION: I deliberately do NOT set parse_mode: 'HTML' on the
 // broadcast text. Managers are typing free text ("Hi 347!" etc.) — if that
@@ -105,13 +110,13 @@ function checkSubscriptionHandler(bot) {
 // going to your whole user base. Swap parse_mode back in if you'd rather
 // managers be able to use bold/links and are okay enforcing valid HTML.
 // ------------------------------------------------
-function pushAnnounceHandler(bot, STATE, { secret } = {}) {
+function pushAnnounceHandler(bot, STATE) {
   return async (req, res) => {
-    if (!secret) {
+    if (!PUSH_BRIDGE_SECRET) {
       console.error('❌ push-announce: PUSH_BRIDGE_SECRET not configured — refusing all requests.');
       return res.status(500).json({ ok: false, error: 'Broadcast bridge not configured' });
     }
-    if (req.headers['x-push-secret'] !== secret) {
+    if (req.headers['x-push-secret'] !== PUSH_BRIDGE_SECRET) {
       return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
