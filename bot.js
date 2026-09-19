@@ -136,7 +136,13 @@ const app = express();
 // ============================================
 // MESSAGE HANDLERS (external module)
 // ============================================
-const { registerStartHandler, checkSubscriptionHandler, pushAnnounceHandler } = require('./messageHandlers');
+const { registerStartHandler, checkSubscriptionHandler, pushAnnounceHandler, loadUsersIntoState } = require('./messageHandlers');
+
+// Restore every user who has ever run /start (from users.json) before
+// registerStartHandler starts adding new ones — otherwise every redeploy
+// wipes STATE.userSessions and /pushAnnounce only reaches people who
+// /start'd since the last deploy.
+loadUsersIntoState(STATE);
 
 registerStartHandler(bot, STATE, WEB_APP_URL);
 app.get('/check-subscription', checkSubscriptionHandler(bot));
@@ -706,16 +712,12 @@ process.on('unhandledRejection', async (reason, promise) => {
 // PERIODIC TASKS
 // ============================================
 
-setInterval(() => {
-  const now = Date.now();
-  const dayInMs = 24 * 60 * 60 * 1000;
-  
-  for (const [chatId, session] of STATE.userSessions.entries()) {
-    if (now - session.lastActive > dayInMs) {
-      STATE.userSessions.delete(chatId);
-    }
-  }
-}, 60 * 60 * 1000);
+// NOTE: this used to delete anyone inactive for 24h from STATE.userSessions,
+// which silently shrank the /pushAnnounce list to "active today" instead of
+// "everyone who ever used the bot". Removed — users.json (via
+// loadUsersIntoState) is now the source of truth for who gets broadcasts,
+// and pruning should only happen on an actual 403 (user blocked the bot),
+// which pushAnnounceHandler already does.
 
 // ============================================
 // STARTUP
