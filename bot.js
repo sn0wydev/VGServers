@@ -136,7 +136,7 @@ const app = express();
 // ============================================
 // MESSAGE HANDLERS (external module)
 // ============================================
-const { registerStartHandler, checkSubscriptionHandler } = require('./messageHandlers');
+const { registerStartHandler, checkSubscriptionHandler, pushAnnounceHandler } = require('./messageHandlers');
 
 registerStartHandler(bot, STATE, WEB_APP_URL);
 app.get('/check-subscription', checkSubscriptionHandler(bot));
@@ -151,7 +151,16 @@ app.use(cors({
   allowedHeaders: ['Content-Type']
 }));
 
-app.use(express.json());
+// Raised from the default ~100kb so a broadcast photo (sent as base64 in
+// the JSON body by the support bot) doesn't get rejected before it even
+// reaches pushAnnounceHandler. — changed for /push-announce
+app.use(express.json({ limit: '10mb' }));
+
+// POST /push-announce — manager broadcast bridge, called by the support
+// bot's /pushAnnounce command. Secret check happens inside
+// pushAnnounceHandler (messageHandlers.js owns that config, not this
+// file). — new
+app.post('/push-announce', pushAnnounceHandler(bot, STATE));
 
 // ============================================
 // LOGGING FUNCTIONS
@@ -252,7 +261,7 @@ async function logTransactionToChannel(userId, username, payment, product, statu
 👤 <b>User:</b> ${user}
 🆔 <b>User ID:</b> <code>${userId}</code>
 📦 <b>Product:</b> ${product.title}
-💎 <b>Product ID:</b> <code>${product.id}</code>
+💎 <b>Product ID:</b> <code>${productId}</code>
 ⭐ <b>Stars:</b> ${product.stars}
 🪙 <b>Coins:</b> ${product.coins}
 📅 <b>Date:</b> ${timestamp}
@@ -372,7 +381,7 @@ app.get('/', (req, res) => {
     service: 'Void Gift Bot - Invoice API',
     version: '7.0',
     uptime: Math.floor((Date.now() - STATE.serverStartTime) / 1000),
-    features: ['openInvoice', 'cloudStorage']
+    features: ['openInvoice', 'cloudStorage', 'pushAnnounce']
   });
 });
 
