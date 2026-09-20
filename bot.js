@@ -1,8 +1,20 @@
 // ============================================
 // TELEGRAM BOT - COMPLETE NODE.JS VERSION
 // ============================================
-// Version: 7.0 - DIRECT INVOICE OPENING (openInvoice)
+// Version: 7.1 - DIRECT INVOICE OPENING (openInvoice) + STAR CREDITS
 // Invoice opens as popup in Mini App - NO chat redirect!
+//
+// 7.1 changes (search "7.1"):
+//   - Paid Stars packages are now actually delivered. Before, nothing ever
+//     wrote the purchased Stars anywhere the app could read (a bot can't
+//     write to a user's Telegram CloudStorage). Now the payment records an
+//     unclaimed credit and the app collects it from GET /stars/claim-credits,
+//     the same pull-model ton-payments.js already uses. Authenticated with
+//     Telegram initData, so one user can't claim another user's credits.
+//   - /check-subscription is registered AFTER cors(), so browsers can read it.
+//   - Invoice text says "N Stars" (it said "N Void Coins", which the app
+//     never credits).
+//   - Fixed a ReferenceError that silently dropped the "PAYMENT INITIATED" log.
 
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
@@ -145,7 +157,10 @@ const { registerStartHandler, checkSubscriptionHandler, pushAnnounceHandler, loa
 loadUsersIntoState(STATE);
 
 registerStartHandler(bot, STATE, WEB_APP_URL);
-app.get('/check-subscription', checkSubscriptionHandler(bot));
+// 7.1: /check-subscription is registered further down, AFTER cors(). Express
+// only applies middleware to routes registered after it, so registering the
+// route here meant it was served without Access-Control-Allow-Origin and the
+// browser refused to let the mini app read the answer.
 
 // ============================================
 // EXPRESS MIDDLEWARE
@@ -154,7 +169,7 @@ app.get('/check-subscription', checkSubscriptionHandler(bot));
 app.use(cors({
   origin: '*', // Allow all origins (you can restrict this to your domain)
   methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type']
+  allowedHeaders: ['Content-Type', 'X-Telegram-Init-Data'] // 7.1: the app sends initData when collecting Star credits
 }));
 
 // Raised from the default ~100kb so a broadcast photo (sent as base64 in
@@ -167,6 +182,9 @@ app.use(express.json({ limit: '10mb' }));
 // pushAnnounceHandler (messageHandlers.js owns that config, not this
 // file). — new
 app.post('/push-announce', pushAnnounceHandler(bot, STATE));
+
+// 7.1: moved here from above the cors() call (see note there).
+app.get('/check-subscription', checkSubscriptionHandler(bot));
 
 // ============================================
 // LOGGING FUNCTIONS
@@ -236,13 +254,13 @@ async function logTransactionToChannel(userId, username, payment, product, statu
 📦 <b>Product:</b> ${product.title}
 💎 <b>Product ID:</b> <code>${product.id}</code>
 ⭐ <b>Stars Paid:</b> ${product.stars}
-🪙 <b>Coins Delivered:</b> ${product.coins}
+⭐ <b>Stars credited:</b> ${product.stars}
 💳 <b>Charge ID:</b> <code>${payment.telegram_payment_charge_id}</code>
 🔗 <b>Provider Charge ID:</b> <code>${payment.provider_payment_charge_id}</code>
 📅 <b>Date:</b> ${timestamp}
 
 <b>Method:</b> openInvoice (Direct Popup)
-<b>Status:</b> Coins added via Cloud Storage
+<b>Status:</b> Credit recorded, the app collects it via /stars/claim-credits
 `;
     } else if (status === 'failed') {
       message = `
@@ -267,7 +285,7 @@ async function logTransactionToChannel(userId, username, payment, product, statu
 👤 <b>User:</b> ${user}
 🆔 <b>User ID:</b> <code>${userId}</code>
 📦 <b>Product:</b> ${product.title}
-💎 <b>Product ID:</b> <code>${productId}</code>
+💎 <b>Product ID:</b> <code>${product.id}</code>
 ⭐ <b>Stars:</b> ${product.stars}
 🪙 <b>Coins:</b> ${product.coins}
 📅 <b>Date:</b> ${timestamp}
@@ -321,32 +339,24 @@ async function savePaymentRecord(userId, chargeId, productId, spentStars, coinsD
   }
 }
 
-async function addCoinsViaCloudStorage(userId, coins) {
+async function notifyStarsPurchased(userId, stars) {
   try {
-    console.log(`💰 Adding ${coins} coins to user ${userId} via Cloud Storage`);
-    
-    // Send success message with button to open app
     await bot.sendMessage(userId,
       `✅ <b>Payment Successful!</b>\n\n` +
-      `${coins} 🪙 Void Coins have been added to your account!\n\n` +
+      `${stars} ⭐ Stars have been added to your account!\n\n` +
       `Open the app to see your new balance.`,
       {
         parse_mode: 'HTML',
         reply_markup: {
           inline_keyboard: [[
-            {
-              text: '🎮 Open App & Collect Coins',
-              web_app: { url: `${WEB_APP_URL}?coins=${coins}&uid=${userId}&t=${Date.now()}` }
-            }
+            { text: '🎮 Open App', web_app: { url: WEB_APP_URL } }
           ]]
         }
       }
     );
-    
     return true;
-    
   } catch (error) {
-    console.error('❌ Error sending coin notification:', error);
+    console.error('⚠️ Could not send purchase notice (non-fatal, credit is recorded):', error.message);
     return false;
   }
 }
@@ -377,6 +387,62 @@ Use: <code>/refund ${chargeId}</code>
 }
 
 // ============================================
+// STAR CREDITS (7.1)
+// ============================================
+// A paid package is recorded here as an unclaimed credit. The app pulls it
+// with GET /stars/claim-credits and applies it to the balance itself,
+// because CloudStorage can only be written from the client. Flat JSON file,
+// same pattern as payments.json / ton_credits.json.
+const crypto = require('crypto');
+const fsSync = require('fs');
+const STAR_CREDITS_FILE = 'star_credits.json';
+
+// userId -> [{ stars, chargeId, productId, createdAt, claimed }]
+let starCredits = {};
+try { starCredits = JSON.parse(fsSync.readFileSync(STAR_CREDITS_FILE, 'utf8')); } catch { starCredits = {}; }
+
+let starCreditsWrite = Promise.resolve();
+function persistStarCredits() {
+  // Serialise writes so two payments landing together can't interleave.
+  starCreditsWrite = starCreditsWrite
+    .then(() => fs.writeFile(STAR_CREDITS_FILE, JSON.stringify(starCredits, null, 2)))
+    .catch(err => console.error('❌ Failed to write star_credits.json:', err));
+  return starCreditsWrite;
+}
+
+// Returns false if this charge was already recorded (Telegram can redeliver
+// an update after a restart; the charge id makes crediting idempotent).
+function recordStarCredit(userId, chargeId, productId, stars) {
+  const key = String(userId);
+  const list = starCredits[key] || (starCredits[key] = []);
+  if (list.some(c => c.chargeId === chargeId)) return false;
+  list.push({ stars, chargeId, productId, createdAt: Date.now(), claimed: false });
+  return true;
+}
+
+// Verifies the raw, Telegram-signed initData string and returns the user.
+// Same algorithm as gift-relayer.js. maxAgeSeconds is generous on purpose:
+// a mini app can stay open for days and initData isn't refreshed while it is.
+function verifyInitData(initData, botToken, maxAgeSeconds = 7 * 24 * 60 * 60) {
+  if (!initData || !botToken) return null;
+  const params = new URLSearchParams(initData);
+  const hash = params.get('hash');
+  if (!hash) return null;
+  params.delete('hash');
+  const dataCheckString = [...params.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+  const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
+  const computed = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+  if (computed.length !== hash.length ||
+      !crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(hash))) return null;
+  const authDate = parseInt(params.get('auth_date'), 10) || 0;
+  if (Date.now() / 1000 - authDate > maxAgeSeconds) return null;
+  try { return JSON.parse(params.get('user') || 'null'); } catch { return null; }
+}
+
+// ============================================
 // HTTP ENDPOINTS
 // ============================================
 
@@ -385,10 +451,44 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'Void Gift Bot - Invoice API',
-    version: '7.0',
+    version: '7.1',
     uptime: Math.floor((Date.now() - STATE.serverStartTime) / 1000),
-    features: ['openInvoice', 'cloudStorage', 'pushAnnounce']
+    features: ['openInvoice', 'starCredits', 'pushAnnounce']
   });
+});
+
+// 7.1: the app calls this after a payment ("paid") to collect purchased Stars.
+// Header: X-Telegram-Init-Data = the raw Telegram.WebApp.initData string.
+app.get('/stars/claim-credits', async (req, res) => {
+  try {
+    const user = verifyInitData(req.get('x-telegram-init-data'), BOT_TOKEN);
+    if (!user || !user.id) return res.status(401).json({ error: 'Invalid or expired Telegram session' });
+
+    const list = starCredits[String(user.id)] || [];
+    const unclaimed = list.filter(c => !c.claimed);
+    if (!unclaimed.length) return res.json({ stars: 0, claimed: [] });
+
+    // Mark claimed synchronously (before any await) so two simultaneous
+    // requests can never both receive the same credit.
+    unclaimed.forEach(c => { c.claimed = true; });
+    const total = unclaimed.reduce((sum, c) => sum + c.stars, 0);
+    await persistStarCredits();
+
+    await sendTransactionLog(`
+📬 <b>STAR CREDITS CLAIMED</b>
+━━━━━━━━━━━━━━━━━━━━
+
+🆔 <b>User ID:</b> <code>${user.id}</code>
+⭐ <b>Stars delivered:</b> ${total}
+💳 <b>Charges:</b> ${unclaimed.map(c => `<code>${c.chargeId}</code>`).join(', ')}
+📅 <b>Date:</b> ${new Date().toISOString()}
+`);
+
+    res.json({ stars: total, claimed: unclaimed.map(c => ({ stars: c.stars, chargeId: c.chargeId })) });
+  } catch (error) {
+    console.error('❌ /stars/claim-credits error:', error);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
 // Create invoice link endpoint
@@ -422,7 +522,7 @@ app.post('/create-invoice', async (req, res) => {
     // Create invoice link using Bot API
     const invoiceLink = await bot.createInvoiceLink(
       product.title,                    // title
-      product.description,              // description
+      `${product.stars} Stars for Void Gift`, // description (7.1: was "N Void Coins", which the app never credits)
       JSON.stringify({                  // payload
         product_id: productId,
         user_id: userId,
@@ -431,7 +531,7 @@ app.post('/create-invoice', async (req, res) => {
       '',                               // provider_token (empty for Stars)
       'XTR',                           // currency (Telegram Stars)
       [{
-        label: `${product.coins} Void Coins`,
+        label: `${product.stars} Stars`,
         amount: product.stars
       }],
       {
@@ -585,7 +685,7 @@ async function handleSuccessfulPayment(msg) {
     }
     
     console.log(`📦 Product: ${product.title}`);
-    console.log(`🪙 Coins to deliver: ${product.coins}`);
+    console.log(`⭐ Stars to credit: ${product.stars}`);
     
     // Save to database
     await savePaymentRecord(
@@ -596,13 +696,24 @@ async function handleSuccessfulPayment(msg) {
       product.coins,
       Date.now()
     );
-    
-    // Deliver coins via Cloud Storage notification
-    const delivered = await addCoinsViaCloudStorage(userId, product.coins);
-    
-    if (!delivered) {
-      throw new Error('Failed to send coin notification');
+
+    // 7.1: record the Stars credit. This is the actual delivery; the app
+    // collects it from /stars/claim-credits. Idempotent per charge id.
+    const isNewCharge = recordStarCredit(
+      userId,
+      payment.telegram_payment_charge_id,
+      productId,
+      product.stars
+    );
+    if (!isNewCharge) {
+      console.log(`↩️  Charge ${payment.telegram_payment_charge_id} already credited — ignoring duplicate update`);
+      return;
     }
+    await persistStarCredits();
+
+    // Best-effort chat notice. It no longer decides whether delivery worked
+    // (a user who blocked the bot still gets their Stars in the app).
+    await notifyStarsPurchased(userId, product.stars);
     
     // Log successful transaction
     await logTransactionToChannel(
@@ -614,7 +725,7 @@ async function handleSuccessfulPayment(msg) {
     );
     
     console.log(`✅ Payment processed successfully!`);
-    console.log(`💰 ${product.coins} coins notification sent to user ${userId}`);
+    console.log(`⭐ ${product.stars} Stars credited to user ${userId}`);
     
   } catch (error) {
     console.error('❌ CRITICAL ERROR processing payment:', error);
@@ -623,12 +734,12 @@ async function handleSuccessfulPayment(msg) {
     // Notify user of error
     await bot.sendMessage(msg.chat.id,
       `⚠️ <b>Payment Received - Processing Issue</b>\n\n` +
-      `Your payment was successful, but there was an error delivering your coins. ` +
+      `Your payment was successful, but there was an error delivering your Stars. ` +
       `Don't worry - our team will resolve this shortly!\n\n` +
       `<b>Payment Details:</b>\n` +
       `Charge ID: <code>${payment.telegram_payment_charge_id}</code>\n` +
       `Amount: ${payment.total_amount} ⭐\n\n` +
-      `Please contact support with the Charge ID above if your coins don't arrive within 24 hours.`,
+      `Please contact support with the Charge ID above if your Stars don't arrive within 24 hours.`,
       { 
         parse_mode: 'HTML'
       }
