@@ -420,6 +420,44 @@ function recordStarCredit(userId, chargeId, productId, stars) {
   return true;
 }
 
+// ============================================
+// NFT TOP-UP RECORDING
+// ============================================
+// Claiming an NFT gift needs a fresh top-up of >= 25 Stars each time. The
+// relayer enforces that, but only prize-store (shared database) can know
+// about payments both services agree on — so every successful Stars payment
+// is also reported there. Idempotent on the charge id, so retrying is safe.
+// Needs PRIZE_STORE_URL + INTERNAL_API_KEY (same values as prize-store/relayer).
+const NFT_PRIZE_STORE_URL = (process.env.PRIZE_STORE_URL || '').replace(/\/$/, '');
+const NFT_INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
+
+async function recordNftTopup(userId, chargeId, stars) {
+  if (!NFT_PRIZE_STORE_URL || !NFT_INTERNAL_API_KEY) {
+    console.warn('⚠️ PRIZE_STORE_URL / INTERNAL_API_KEY not set — top-up NOT recorded for the NFT gate');
+    return false;
+  }
+  let lastErr;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const r = await fetch(`${NFT_PRIZE_STORE_URL}/internal/topups`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-internal-key': NFT_INTERNAL_API_KEY },
+        body: JSON.stringify({ user_id: userId, stars, payment_id: chargeId }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (r.ok) return true;
+      lastErr = new Error(`prize-store HTTP ${r.status}`);
+      if (r.status >= 400 && r.status < 500) break; // won't get better by retrying
+    } catch (err) {
+      lastErr = err;
+    }
+    await new Promise(res => setTimeout(res, 500 * attempt * attempt));
+  }
+  console.error(`❌ Could not record top-up for user ${userId} charge ${chargeId}:`, lastErr?.message);
+  await sendErrorLog(lastErr || new Error('unknown'), `NFT top-up not recorded — user ${userId}, charge ${chargeId}, ${stars} Stars. Grant manually with /grantnft ${userId}`);
+  return false;
+}
+
 // Verifies the raw, Telegram-signed initData string and returns the user.
 // Same algorithm as gift-relayer.js. maxAgeSeconds is generous on purpose:
 // a mini app can stay open for days and initData isn't refreshed while it is.
@@ -710,6 +748,12 @@ async function handleSuccessfulPayment(msg) {
       return;
     }
     await persistStarCredits();
+
+    // Tell prize-store about the top-up (NFT claim gate). Best effort: a
+    // failure here is logged to the system topic and must never affect the
+    // player's Stars delivery above.
+    recordNftTopup(userId, payment.telegram_payment_charge_id, product.stars)
+      .catch(err => console.error('❌ recordNftTopup crashed:', err.message));
 
     // Best-effort chat notice. It no longer decides whether delivery worked
     // (a user who blocked the bot still gets their Stars in the app).
