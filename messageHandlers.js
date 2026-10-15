@@ -99,26 +99,158 @@ function registerStartHandler(bot, STATE, WEB_APP_URL) {
 
 // ------------------------------------------------
 // 2. GET /check-subscription?user_id=...&channel=...
-// Returns { subscribed: true|false } as script.js expects.
-// Uses bot.getChatMember, which requires the bot to be an
-// admin of the channel to reliably see membership status.
+// Returns { subscribed: true|false } as script.js expects, plus:
+//   source: 'override' | 'cache' | 'telegram'   (how the answer was reached)
+//   error:  'unavailable' | 'config'            (only when it could NOT verify)
+//
+// What changed vs. the old version (why some users kept failing):
+//   - A transient Telegram/network error (429, 5xx, timeout) used to come
+//     back as a plain `subscribed:false`, so a perfectly subscribed user was
+//     told "you haven't joined". Now it's retried with backoff, and if it
+//     still can't be verified the response says so (`error`) so the app can
+//     show "couldn't verify, try again" instead.
+//   - Members whose status is `restricted` (but still in the channel, e.g.
+//     muted by an admin) were counted as NOT subscribed. They count now.
+//   - Positive answers are cached for a few minutes and concurrent checks
+//     for the same user share one Telegram call, so a busy moment can't
+//     push the bot into Telegram's rate limit.
+//   - Manual override: a manager can mark a user as subscribed with
+//     /setsub in the support bot (stored in prize-store).
+//   - The channel comes from the server (SUBSCRIPTION_CHANNEL env var,
+//     default @VoidGiftsOfficial), not from the query string.
+//
+// Env (all optional):
+//   SUBSCRIPTION_CHANNEL    channel @username or id            (default @VoidGiftsOfficial)
+//   PRIZE_STORE_URL         enables the manual override lookup (same URL the relayer uses)
+//   SUBSCRIPTION_FAIL_OPEN  'true' = if Telegram can't be reached at all, let the
+//                           user through instead of blocking them     (default false)
+//
+// The bot MUST be an admin of the channel to see membership reliably.
 // ------------------------------------------------
+const SUBSCRIPTION_CHANNEL = process.env.SUBSCRIPTION_CHANNEL || '@VoidGiftsOfficial';
+const PRIZE_STORE_URL = (process.env.PRIZE_STORE_URL || '').replace(/\/$/, '');
+const SUBSCRIPTION_FAIL_OPEN = String(process.env.SUBSCRIPTION_FAIL_OPEN || '').toLowerCase() === 'true';
+
+const SUB_POSITIVE_TTL_MS = 10 * 60 * 1000; // remember "subscribed" for 10 min
+const SUB_OVERRIDE_TTL_MS = 30 * 1000;      // re-read the manual override every 30 s
+const subPositiveCache = new Map();         // userId -> expiresAt
+const subOverrideCache = new Map();         // userId -> { value, expiresAt }
+const subInFlight = new Map();              // userId -> Promise<{subscribed, source}>
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Read the manual override from prize-store. Any failure just means "no
+// override" — it must never break (or slow down) the real check.
+async function hasSubscriptionOverride(userId) {
+  if (!PRIZE_STORE_URL) return false;
+  const cached = subOverrideCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  try {
+    const r = await fetch(`${PRIZE_STORE_URL}/users/${encodeURIComponent(userId)}/subscription`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!r.ok) return false;
+    const data = await r.json();
+    const value = data.subscription_override === true;
+    subOverrideCache.set(userId, { value, expiresAt: Date.now() + SUB_OVERRIDE_TTL_MS });
+    return value;
+  } catch (err) {
+    console.warn('⚠️ subscription override lookup failed (ignored):', err.message);
+    return false;
+  }
+}
+
+function telegramErrorInfo(error) {
+  const body = error?.response?.body || {};
+  return {
+    code: body.error_code || error?.response?.statusCode || 0,
+    description: String(body.description || error?.message || ''),
+    retryAfter: body.parameters?.retry_after,
+  };
+}
+
+// Calls getChatMember, retrying only errors that are plausibly temporary.
+async function getMemberWithRetry(bot, userId) {
+  const MAX_ATTEMPTS = 3;
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await bot.getChatMember(SUBSCRIPTION_CHANNEL, userId);
+    } catch (error) {
+      lastError = error;
+      const { code, description, retryAfter } = telegramErrorInfo(error);
+
+      // Definitive answers — retrying won't change them.
+      if (/user not found|PARTICIPANT_ID_INVALID/i.test(description)) return { status: 'left' };
+      if (/chat not found|not enough rights|member list is inaccessible|bot is not a member|CHAT_ADMIN_REQUIRED/i.test(description)) {
+        error.isConfigError = true;
+        throw error;
+      }
+      if (code === 400 || code === 401 || code === 403) throw error;
+
+      // Temporary: 429 (rate limit), 5xx, or a network error with no HTTP code.
+      if (attempt < MAX_ATTEMPTS) {
+        const wait = code === 429 && retryAfter ? Math.min(retryAfter, 3) * 1000 : 300 * attempt * attempt;
+        await sleep(wait);
+      }
+    }
+  }
+  throw lastError;
+}
+
+function isSubscribedStatus(member) {
+  if (['member', 'administrator', 'creator'].includes(member.status)) return true;
+  // `restricted` users are still in the channel when is_member is true.
+  if (member.status === 'restricted' && member.is_member === true) return true;
+  return false; // 'left', 'kicked', restricted-and-not-a-member
+}
+
+async function resolveSubscription(bot, userId) {
+  if (await hasSubscriptionOverride(userId)) return { subscribed: true, source: 'override' };
+
+  const cachedUntil = subPositiveCache.get(userId);
+  if (cachedUntil && cachedUntil > Date.now()) return { subscribed: true, source: 'cache' };
+
+  const member = await getMemberWithRetry(bot, userId);
+  const subscribed = isSubscribedStatus(member);
+  if (subscribed) subPositiveCache.set(userId, Date.now() + SUB_POSITIVE_TTL_MS);
+  else subPositiveCache.delete(userId); // never cache "no": they may join a second from now
+  return { subscribed, source: 'telegram' };
+}
+
 function checkSubscriptionHandler(bot) {
   return async (req, res) => {
-    const { user_id, channel } = req.query;
+    const userId = String(req.query.user_id || '').trim();
 
-    if (!user_id || !channel) {
-      return res.status(400).json({ subscribed: false, error: 'Missing user_id or channel' });
+    if (!/^\d{1,15}$/.test(userId)) {
+      return res.status(400).json({ subscribed: false, error: 'Missing or invalid user_id' });
     }
 
     try {
-      const member = await bot.getChatMember(channel, user_id);
-      const subscribed = ['member', 'administrator', 'creator'].includes(member.status);
-      return res.json({ subscribed });
+      // Share one in-flight lookup between concurrent requests for a user
+      // (double taps, the auto-retry on the client, etc.).
+      let pending = subInFlight.get(userId);
+      if (!pending) {
+        pending = resolveSubscription(bot, userId).finally(() => subInFlight.delete(userId));
+        subInFlight.set(userId, pending);
+      }
+      const result = await pending;
+      return res.json(result);
     } catch (error) {
-      console.error('❌ check-subscription error:', error.message);
-      // Fail closed, matching the frontend's own fail-closed behavior.
-      return res.json({ subscribed: false });
+      const { description } = telegramErrorInfo(error);
+      if (error.isConfigError) {
+        // Affects EVERYONE, not just this user — make it loud.
+        console.error(`🚨 check-subscription: bot can't read channel ${SUBSCRIPTION_CHANNEL} (${description}). Make the bot an ADMIN of the channel and check SUBSCRIPTION_CHANNEL.`);
+      } else {
+        console.error(`❌ check-subscription could not verify ${userId}: ${description}`);
+      }
+
+      if (SUBSCRIPTION_FAIL_OPEN) {
+        return res.json({ subscribed: true, source: 'fail-open', error: error.isConfigError ? 'config' : 'unavailable' });
+      }
+      // Fail closed, but tell the client this was a failure to verify —
+      // NOT a confirmed "this person hasn't joined".
+      return res.json({ subscribed: false, error: error.isConfigError ? 'config' : 'unavailable' });
     }
   };
 }
