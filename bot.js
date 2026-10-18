@@ -20,6 +20,9 @@ const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs').promises;
+const nodePath = require('path');
+const DATA_DIR = process.env.DATA_DIR || __dirname;   // set to your Railway volume mount path (e.g. /data) so payments / credits / users survive redeploys
+const dataFile = (name) => nodePath.join(DATA_DIR, name);
 
 // ============================================
 // CONFIGURATION
@@ -148,7 +151,7 @@ const app = express();
 // ============================================
 // MESSAGE HANDLERS (external module)
 // ============================================
-const { registerStartHandler, checkSubscriptionHandler, pushAnnounceHandler, loadUsersIntoState } = require('./messageHandlers');
+const { registerStartHandler, checkSubscriptionHandler, pushAnnounceHandler, loadUsersIntoState, tr } = require('./messageHandlers');
 
 // Restore every user who has ever run /start (from users.json) before
 // registerStartHandler starts adding new ones — otherwise every redeploy
@@ -311,7 +314,7 @@ async function savePaymentRecord(userId, chargeId, productId, spentStars, coinsD
   try {
     let payments = [];
     try {
-      const data = await fs.readFile('payments.json', 'utf8');
+      const data = await fs.readFile(dataFile('payments.json'), 'utf8');
       payments = JSON.parse(data);
     } catch (e) {
       // File doesn't exist yet
@@ -330,7 +333,7 @@ async function savePaymentRecord(userId, chargeId, productId, spentStars, coinsD
     };
     
     payments.push(payment);
-    await fs.writeFile('payments.json', JSON.stringify(payments, null, 2));
+    await fs.writeFile(dataFile('payments.json'), JSON.stringify(payments, null, 2));
     
     console.log('💾 Payment saved to database:', payment.id);
     
@@ -341,15 +344,13 @@ async function savePaymentRecord(userId, chargeId, productId, spentStars, coinsD
 
 async function notifyStarsPurchased(userId, stars) {
   try {
-    await bot.sendMessage(userId,
-      `✅ <b>Payment Successful!</b>\n\n` +
-      `${stars} ⭐ Stars have been added to your account!\n\n` +
-      `Open the app to see your new balance.`,
+    const L = tr(STATE, userId);   // the language the player chose in /start (English if none)
+    await bot.sendMessage(userId, L.paid(stars),
       {
         parse_mode: 'HTML',
         reply_markup: {
           inline_keyboard: [[
-            { text: '🎮 Open App', web_app: { url: WEB_APP_URL } }
+            { text: L.openApp, web_app: { url: WEB_APP_URL } }
           ]]
         }
       }
@@ -395,7 +396,7 @@ Use: <code>/refund ${chargeId}</code>
 // same pattern as payments.json / ton_credits.json.
 const crypto = require('crypto');
 const fsSync = require('fs');
-const STAR_CREDITS_FILE = 'star_credits.json';
+const STAR_CREDITS_FILE = dataFile('star_credits.json');
 
 // userId -> [{ stars, chargeId, productId, createdAt, claimed }]
 let starCredits = {};
@@ -418,6 +419,44 @@ function recordStarCredit(userId, chargeId, productId, stars) {
   if (list.some(c => c.chargeId === chargeId)) return false;
   list.push({ stars, chargeId, productId, createdAt: Date.now(), claimed: false });
   return true;
+}
+
+// ============================================
+// NFT TOP-UP RECORDING
+// ============================================
+// Claiming an NFT gift needs a fresh top-up of >= 25 Stars each time. The
+// relayer enforces that, but only prize-store (shared database) can know
+// about payments both services agree on — so every successful Stars payment
+// is also reported there. Idempotent on the charge id, so retrying is safe.
+// Needs PRIZE_STORE_URL + INTERNAL_API_KEY (same values as prize-store/relayer).
+const NFT_PRIZE_STORE_URL = (process.env.PRIZE_STORE_URL || '').replace(/\/$/, '');
+const NFT_INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
+
+async function recordNftTopup(userId, chargeId, stars) {
+  if (!NFT_PRIZE_STORE_URL || !NFT_INTERNAL_API_KEY) {
+    console.warn('⚠️ PRIZE_STORE_URL / INTERNAL_API_KEY not set — top-up NOT recorded for the NFT gate');
+    return false;
+  }
+  let lastErr;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const r = await fetch(`${NFT_PRIZE_STORE_URL}/internal/topups`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-internal-key': NFT_INTERNAL_API_KEY },
+        body: JSON.stringify({ user_id: userId, stars, payment_id: chargeId }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (r.ok) return true;
+      lastErr = new Error(`prize-store HTTP ${r.status}`);
+      if (r.status >= 400 && r.status < 500) break; // won't get better by retrying
+    } catch (err) {
+      lastErr = err;
+    }
+    await new Promise(res => setTimeout(res, 500 * attempt * attempt));
+  }
+  console.error(`❌ Could not record top-up for user ${userId} charge ${chargeId}:`, lastErr?.message);
+  await sendErrorLog(lastErr || new Error('unknown'), `NFT top-up not recorded — user ${userId}, charge ${chargeId}, ${stars} Stars. Grant manually with /grantnft ${userId}`);
+  return false;
 }
 
 // Verifies the raw, Telegram-signed initData string and returns the user.
@@ -711,6 +750,12 @@ async function handleSuccessfulPayment(msg) {
     }
     await persistStarCredits();
 
+    // Tell prize-store about the top-up (NFT claim gate). Best effort: a
+    // failure here is logged to the system topic and must never affect the
+    // player's Stars delivery above.
+    recordNftTopup(userId, payment.telegram_payment_charge_id, product.stars)
+      .catch(err => console.error('❌ recordNftTopup crashed:', err.message));
+
     // Best-effort chat notice. It no longer decides whether delivery worked
     // (a user who blocked the bot still gets their Stars in the app).
     await notifyStarsPurchased(userId, product.stars);
@@ -733,16 +778,8 @@ async function handleSuccessfulPayment(msg) {
     
     // Notify user of error
     await bot.sendMessage(msg.chat.id,
-      `⚠️ <b>Payment Received - Processing Issue</b>\n\n` +
-      `Your payment was successful, but there was an error delivering your Stars. ` +
-      `Don't worry - our team will resolve this shortly!\n\n` +
-      `<b>Payment Details:</b>\n` +
-      `Charge ID: <code>${payment.telegram_payment_charge_id}</code>\n` +
-      `Amount: ${payment.total_amount} ⭐\n\n` +
-      `Please contact support with the Charge ID above if your Stars don't arrive within 24 hours.`,
-      { 
-        parse_mode: 'HTML'
-      }
+      tr(STATE, msg.chat.id).paidIssue(payment.telegram_payment_charge_id, payment.total_amount),
+      { parse_mode: 'HTML' }
     );
     
     // Log failed delivery for manual intervention
@@ -766,6 +803,7 @@ bot.onText(/\/help/, async (msg) => {
 
 <b>Game Commands:</b>
 /start - Open the mini app
+/language - Change language (English / Русский)
 
 <b>Payment System:</b>
 ✅ Direct invoice opening with openInvoice()
